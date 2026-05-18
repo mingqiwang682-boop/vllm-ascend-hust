@@ -217,6 +217,100 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
         )
 
 
+def _first_true_index(mask: torch.Tensor) -> torch.Tensor:
+    """Return the first true index, or len(mask) when the mask is all false."""
+    prefix_counts = torch.cumsum(mask.to(torch.int64), dim=0)
+    return torch.searchsorted(prefix_counts, prefix_counts.new_tensor(1))
+
+
+def _split_decode_prefill_boundary(
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
+    num_tokens: int,
+    max_query_len: int,
+    decode_threshold: int = 1,
+    *,
+    query_lens: torch.Tensor | None = None,
+    require_uniform: bool = False,
+    treat_short_extends_as_decodes: bool = True,
+    is_prefilling: torch.Tensor | None = None,
+) -> tuple[int, int, int, int]:
+    if num_reqs == 0:
+        return 0, 0, 0, 0
+
+    if (
+        max_query_len <= decode_threshold
+        and (not require_uniform or decode_threshold <= 1)
+        and treat_short_extends_as_decodes
+    ):
+        return num_reqs, 0, num_tokens, 0
+
+    query_start_loc = query_start_loc[: num_reqs + 1]
+    if query_lens is None:
+        query_lens = torch.diff(query_start_loc)
+    else:
+        query_lens = query_lens[:num_reqs]
+        if query_lens.device != query_start_loc.device:
+            query_lens = query_lens.to(query_start_loc.device)
+
+    force_all_decode = torch.tensor(False, device=query_start_loc.device)
+    if require_uniform:
+        first_query_len = query_lens[0]
+        uniform_or_pad = (query_lens == first_query_len) | (query_lens == 0)
+        first_is_prefill = first_query_len > decode_threshold
+        force_all_decode = torch.all(uniform_or_pad) & ~first_is_prefill
+        is_prefill = query_lens != first_query_len
+        is_prefill = torch.where(
+            force_all_decode,
+            torch.zeros_like(is_prefill),
+            is_prefill,
+        )
+        is_prefill = torch.where(
+            first_is_prefill,
+            torch.ones_like(is_prefill),
+            is_prefill,
+        )
+    else:
+        is_prefill = query_lens > decode_threshold
+
+    if not treat_short_extends_as_decodes:
+        assert is_prefilling is not None
+        short_extend_prefills = is_prefilling[:num_reqs].to(
+            device=query_start_loc.device, dtype=torch.bool
+        )
+        short_extend_prefills = torch.where(
+            force_all_decode,
+            torch.zeros_like(short_extend_prefills),
+            short_extend_prefills,
+        )
+        is_prefill |= short_extend_prefills
+
+    first_prefill = _first_true_index(is_prefill)
+    num_reqs_t = first_prefill.new_tensor(num_reqs)
+    num_tokens_t = torch.tensor(
+        num_tokens, dtype=torch.int64, device=query_start_loc.device
+    )
+    num_decodes = first_prefill
+    num_prefills = num_reqs_t - num_decodes
+    num_decode_tokens = torch.where(
+        first_prefill < num_reqs_t,
+        query_start_loc[first_prefill].to(torch.int64),
+        num_tokens_t,
+    )
+    num_prefill_tokens = num_tokens_t - num_decode_tokens
+
+    result = torch.stack(
+        [
+            num_decodes.to(torch.int64),
+            num_prefills.to(torch.int64),
+            num_decode_tokens,
+            num_prefill_tokens,
+        ]
+    ).cpu()
+    result_list = result.tolist()
+    return result_list[0], result_list[1], result_list[2], result_list[3]
+
+
 def filter_chunked_req_indices(
     seq_len: torch.Tensor,
     mask_for_non_zero_chunk: list[bool] | None,
@@ -271,20 +365,14 @@ def split_decodes_and_prefills(
     num_tokens = common_attn_metadata.num_actual_tokens
     query_start_loc = common_attn_metadata.query_start_loc_cpu
 
-    if max_query_len <= decode_threshold:
-        return num_reqs, 0, num_tokens, 0
-
-    query_lens = (query_start_loc[1:] - query_start_loc[:-1]) if query_lens_pcp_full is None else query_lens_pcp_full
-    is_prefill = query_lens > decode_threshold
-    if not torch.any(is_prefill):
-        return num_reqs, 0, num_tokens, 0
-
-    first_prefill = is_prefill.int().argmax(dim=-1).item()
-    num_decodes = first_prefill
-    num_prefills = num_reqs - num_decodes
-    num_decode_tokens = query_start_loc[first_prefill].item()
-    num_prefill_tokens = num_tokens - num_decode_tokens
-    return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
+    return _split_decode_prefill_boundary(
+        query_start_loc,
+        num_reqs,
+        num_tokens,
+        max_query_len,
+        decode_threshold,
+        query_lens=query_lens_pcp_full,
+    )
 
 
 def wait_for_kv_layer_from_connector(layer_name: str):
